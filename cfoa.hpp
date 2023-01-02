@@ -1270,7 +1270,7 @@ public:
   }
 
   template<typename Key,typename F>
-  BOOST_FORCEINLINE void find(const Key& x,F f)const
+  BOOST_FORCEINLINE bool find(const Key& x,F f)const
   {
     return const_cast<table_core*>(this)->find(x,f);
   }
