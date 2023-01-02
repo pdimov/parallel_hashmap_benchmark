@@ -25,6 +25,7 @@
 #include "cfoa.hpp"
 #include "cuckoohash_map.hh"
 #include "oneapi/tbb/concurrent_hash_map.h"
+#include "gtl/phmap.hpp"
 
 int const Th = 8; // number of threads
 int const Sh = Th * Th; // number of shards
@@ -1588,6 +1589,94 @@ struct tbb_concurrent_hash_map
     }
 };
 
+template<class Mutex> struct gtl_parallel_flat_hash_map
+{
+    gtl::parallel_flat_hash_map<
+        std::string_view, std::size_t,
+        boost::hash<std::string_view>, std::equal_to<std::string_view>,
+        std::allocator<std::pair<const std::string_view, int>>, 6, Mutex> map;
+
+    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    map.lazy_emplace_l(
+                        words[j],
+                        []( auto& x ){ ++x.second; },
+                        [&]( auto const& ctor ){ ctor(words[j], 0); });
+                    ++s2;
+                }
+
+                s += s2;
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        print_time( t1, "Word count", s, map.size() );
+
+        std::cout << std::endl;
+    }
+
+    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    std::string_view w2( words[j] );
+                    w2.remove_prefix( 1 );
+
+                    s2 += map.contains( w2 );
+                }
+
+                s += s2;
+
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        print_time( t1, "Contains", s, map.size() );
+
+        std::cout << std::endl;
+    }
+};
+
 //
 
 struct record
@@ -1640,6 +1729,9 @@ int main()
     test<ufm_concurrent_foa>( "concurrent foa" );
     test<libcuckoo_cuckoohash_map>( "libcuckoo::cuckoohash_map" );
     test<tbb_concurrent_hash_map>( "tbb::concurrent_hash_map" );
+    test<gtl_parallel_flat_hash_map<std::mutex>>( "gtl::parallel_flat_hash_map<std::mutex>" );
+    test<gtl_parallel_flat_hash_map<std::shared_mutex>>( "gtl::parallel_flat_hash_map<std::shared_mutex>" );
+    test<gtl_parallel_flat_hash_map<rw_spinlock>>( "gtl::parallel_flat_hash_map<rw_spinlock>" );
 
     std::cout << "---\n\n";
 
