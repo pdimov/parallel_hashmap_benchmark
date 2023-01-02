@@ -1398,7 +1398,7 @@ struct ufm_concurrent_foa
     }
 };
 
-struct ufm_libcuckoo_cuckoohash_map
+struct libcuckoo_cuckoohash_map
 {
     libcuckoo::cuckoohash_map<
         std::string_view, std::size_t,
@@ -1486,7 +1486,7 @@ struct ufm_libcuckoo_cuckoohash_map
     }
 };
 
-struct ufm_tbb_concurrent_hash_map
+struct tbb_concurrent_hash_map
 {
     struct hash_compare
     {
@@ -1638,8 +1638,8 @@ int main()
     test<ufm_sharded_isolated>( "boost::unordered_flat_map, sharded isolated" );
     test<ufm_sharded_isolated_prehashed>( "boost::unordered_flat_map, sharded isolated, prehashed" );
     test<ufm_concurrent_foa>( "concurrent foa" );
-    test<ufm_libcuckoo_cuckoohash_map>( "libcuckoo::cuckoohash_map" );
-    test<ufm_tbb_concurrent_hash_map>( "tbb::concurrent_hash_map" );
+    test<libcuckoo_cuckoohash_map>( "libcuckoo::cuckoohash_map" );
+    test<tbb_concurrent_hash_map>( "tbb::concurrent_hash_map" );
 
     std::cout << "---\n\n";
 
