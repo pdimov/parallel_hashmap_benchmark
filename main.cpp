@@ -21,6 +21,7 @@
 #include <thread>
 #include <atomic>
 #include <shared_mutex>
+#include "rw_spinlock.hpp"
 #include "cfoa.hpp"
 #include "cuckoohash_map.hh"
 #include "oneapi/tbb/concurrent_hash_map.h"
@@ -247,6 +248,92 @@ struct ufm_rwlock
                 for( std::size_t j = start; j < end; ++j )
                 {
                     std::shared_lock<std::shared_mutex> lock(mtx);
+
+                    std::string_view w2( words[j] );
+                    w2.remove_prefix( 1 );
+
+                    s2 += map.contains( w2 );
+                }
+
+                s += s2;
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        print_time( t1, "Contains", s, map.size() );
+
+        std::cout << std::endl;
+    }
+};
+
+struct ufm_rw_spinlock
+{
+    alignas(64) boost::unordered_flat_map<std::string_view, std::size_t> map;
+    alignas(64) rw_spinlock mtx;
+
+    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    std::lock_guard<rw_spinlock> lock( mtx );
+
+                    ++map[ words[j] ];
+                    ++s2;
+                }
+
+                s += s2;
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        print_time( t1, "Word count", s, map.size() );
+
+        std::cout << std::endl;
+    }
+
+    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    std::shared_lock<rw_spinlock> lock(mtx);
 
                     std::string_view w2( words[j] );
                     w2.remove_prefix( 1 );
@@ -731,6 +818,220 @@ struct ufm_sharded_rwlock_prehashed
                     std::size_t shard = x.h % Sh;
 
                     std::shared_lock<std::shared_mutex> lock( sync[ shard ].mtx );
+
+                    s2 += sync[ shard ].map.contains( x );
+                }
+
+                s += s2;
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        std::size_t n = 0;
+
+        for( std::size_t i = 0; i < Sh; ++i )
+        {
+            n += sync[ i ].map.size();
+        }
+
+        print_time( t1, "Contains", s, n );
+
+        std::cout << std::endl;
+    }
+};
+
+struct ufm_sharded_rw_spinlock
+{
+    sync_map<rw_spinlock> sync[ Sh ];
+
+    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    auto const& word = words[ j ];
+
+                    std::size_t hash = boost::hash<std::string_view>()( word );
+                    std::size_t shard = hash % Sh;
+
+                    std::lock_guard<rw_spinlock> lock( sync[ shard ].mtx );
+
+                    ++sync[ shard ].map[ word ];
+                    ++s2;
+                }
+
+                s += s2;
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        std::size_t n = 0;
+
+        for( std::size_t i = 0; i < Sh; ++i )
+        {
+            n += sync[ i ].map.size();
+        }
+
+        print_time( t1, "Word count", s, n );
+
+        std::cout << std::endl;
+    }
+
+    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    std::string_view w2( words[j] );
+                    w2.remove_prefix( 1 );
+
+                    std::size_t hash = boost::hash<std::string_view>()( w2 );
+                    std::size_t shard = hash % Sh;
+
+                    std::shared_lock<rw_spinlock> lock( sync[ shard ].mtx );
+
+                    s2 += sync[ shard ].map.contains( w2 );
+                }
+
+                s += s2;
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        std::size_t n = 0;
+
+        for( std::size_t i = 0; i < Sh; ++i )
+        {
+            n += sync[ i ].map.size();
+        }
+
+        print_time( t1, "Contains", s, n );
+
+        std::cout << std::endl;
+    }
+};
+
+struct ufm_sharded_rw_spinlock_prehashed
+{
+    sync_map_prehashed<rw_spinlock> sync[ Sh ];
+
+    BOOST_NOINLINE void test_word_count( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    std::string_view word = words[ j ];
+
+                    prehashed x( word );
+                    std::size_t shard = x.h % Sh;
+
+                    std::lock_guard<rw_spinlock> lock( sync[ shard ].mtx );
+
+                    ++sync[ shard ].map[ x ];
+                    ++s2;
+                }
+
+                s += s2;
+            });
+        }
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ].join();
+        }
+
+        std::size_t n = 0;
+
+        for( std::size_t i = 0; i < Sh; ++i )
+        {
+            n += sync[ i ].map.size();
+        }
+
+        print_time( t1, "Word count", s, n );
+
+        std::cout << std::endl;
+    }
+
+    BOOST_NOINLINE void test_contains( std::chrono::steady_clock::time_point & t1 )
+    {
+        std::atomic<std::size_t> s = 0;
+
+        std::thread th[ Th ];
+
+        std::size_t m = words.size() / Th;
+
+        for( std::size_t i = 0; i < Th; ++i )
+        {
+            th[ i ] = std::thread( [this, i, m, &s]{
+
+                std::size_t s2 = 0;
+
+                std::size_t start = i * m;
+                std::size_t end = i == Th-1? words.size(): (i + 1) * m;
+
+                for( std::size_t j = start; j < end; ++j )
+                {
+                    std::string_view w2( words[j] );
+                    w2.remove_prefix( 1 );
+
+                    prehashed x( w2 );
+                    std::size_t shard = x.h % Sh;
+
+                    std::shared_lock<rw_spinlock> lock( sync[ shard ].mtx );
 
                     s2 += sync[ shard ].map.contains( x );
                 }
@@ -1327,10 +1628,13 @@ int main()
     test<ufm_single_threaded>( "boost::unordered_flat_map, single threaded" );
     test<ufm_mutex>( "boost::unordered_flat_map, mutex" );
     test<ufm_rwlock>( "boost::unordered_flat_map, rwlock" );
+    test<ufm_rw_spinlock>( "boost::unordered_flat_map, rw_spinlock" );
     test<ufm_sharded_mutex>( "boost::unordered_flat_map, sharded mutex" );
     test<ufm_sharded_mutex_prehashed>( "boost::unordered_flat_map, sharded mutex, prehashed" );
     test<ufm_sharded_rwlock>( "boost::unordered_flat_map, sharded rwlock" );
     test<ufm_sharded_rwlock_prehashed>( "boost::unordered_flat_map, sharded rwlock, prehashed" );
+    test<ufm_sharded_rw_spinlock>( "boost::unordered_flat_map, sharded rw_spinlock" );
+    test<ufm_sharded_rw_spinlock_prehashed>( "boost::unordered_flat_map, sharded rw_spinlock, prehashed" );
     test<ufm_sharded_isolated>( "boost::unordered_flat_map, sharded isolated" );
     test<ufm_sharded_isolated_prehashed>( "boost::unordered_flat_map, sharded isolated, prehashed" );
     test<ufm_concurrent_foa>( "concurrent foa" );
