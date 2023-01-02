@@ -22,17 +22,8 @@ private:
 
 private:
 
-    static void yield_k( unsigned k ) noexcept
-    {
-        if( k < 49152 )
-        {
-            boost::detail::sp_thread_pause();
-        }
-        else
-        {
-            boost::detail::sp_thread_sleep();
-        }
-    }
+    // number of times to spin before sleeping
+    static constexpr int spin_count = 49152;
 
 public:
 
@@ -52,17 +43,22 @@ public:
 
     void lock_shared() noexcept
     {
-        for( unsigned k = 0;; ++k )
+        for( ;; )
         {
-            std::uint32_t st = state_.load( std::memory_order_relaxed );
-
-            if( st < 0x3FFF'FFFF )
+            for( int k = 0; k < spin_count; ++k )
             {
-                std::uint32_t newst = st + 1;
-                if( state_.compare_exchange_strong( st, newst, std::memory_order_acquire, std::memory_order_relaxed ) ) break;
+                std::uint32_t st = state_.load( std::memory_order_relaxed );
+
+                if( st < 0x3FFF'FFFF )
+                {
+                    std::uint32_t newst = st + 1;
+                    if( state_.compare_exchange_weak( st, newst, std::memory_order_acquire, std::memory_order_relaxed ) ) return;
+                }
+
+                boost::detail::sp_thread_pause();
             }
 
-            yield_k( k );
+            boost::detail::sp_thread_sleep();
         }
     }
 
@@ -105,34 +101,71 @@ public:
 
     void lock() noexcept
     {
-        for( unsigned k = 0;; ++k )
+        for( ;; )
         {
-            std::uint32_t st = state_.load( std::memory_order_relaxed );
-
-            if( st & 0x8000'0000 )
+            for( int k = 0; k < spin_count; ++k )
             {
-                // locked exclusive, spin
-            }
-            else if( ( st & 0x3FFF'FFFF ) == 0 )
-            {
-                // not locked exclusive, not locked shared, try to lock
+                std::uint32_t st = state_.load( std::memory_order_relaxed );
 
-                std::uint32_t newst = 0x8000'0000;
-                if( state_.compare_exchange_strong( st, newst, std::memory_order_acquire, std::memory_order_relaxed ) ) break;
-            }
-            else if( st & 0x4000'000 )
-            {
-                // writer pending bit already set, nothing to do
-            }
-            else
-            {
-                // locked shared, set writer pending bit
+                if( st & 0x8000'0000 )
+                {
+                    // locked exclusive, spin
+                }
+                else if( ( st & 0x3FFF'FFFF ) == 0 )
+                {
+                    // not locked exclusive, not locked shared, try to lock
 
-                std::uint32_t newst = st | 0x4000'0000;
-                state_.compare_exchange_strong( st, newst, std::memory_order_relaxed, std::memory_order_relaxed );
+                    std::uint32_t newst = 0x8000'0000;
+                    if( state_.compare_exchange_weak( st, newst, std::memory_order_acquire, std::memory_order_relaxed ) ) return;
+                }
+                else if( st & 0x4000'000 )
+                {
+                    // writer pending bit already set, nothing to do
+                }
+                else
+                {
+                    // locked shared, set writer pending bit
+
+                    std::uint32_t newst = st | 0x4000'0000;
+                    state_.compare_exchange_weak( st, newst, std::memory_order_relaxed, std::memory_order_relaxed );
+                }
+
+                boost::detail::sp_thread_pause();
             }
 
-            yield_k( k );
+            // clear writer pending bit before going to sleep
+
+            for( ;; )
+            {
+                std::uint32_t st = state_.load( std::memory_order_relaxed );
+
+                if( st & 0x8000'0000 )
+                {
+                    // locked exclusive, nothing to do
+                    break;
+                }
+                else if( ( st & 0x3FFF'FFFF ) == 0 )
+                {
+                    // lock free, try to take it
+
+                    std::uint32_t newst = 0x8000'0000;
+                    if( state_.compare_exchange_weak( st, newst, std::memory_order_acquire, std::memory_order_relaxed ) ) return;
+                }
+                else if( ( st & 0x4000'0000 ) == 0 )
+                {
+                    // writer pending bit already clear, nothing to do
+                    break;
+                }
+                else
+                {
+                    // clear writer pending bit
+
+                    std::uint32_t newst = st & ~0x4000'0000u;
+                    if( state_.compare_exchange_weak( st, newst, std::memory_order_relaxed, std::memory_order_relaxed ) ) break;
+                }
+            }
+
+            boost::detail::sp_thread_sleep();
         }
     }
 
