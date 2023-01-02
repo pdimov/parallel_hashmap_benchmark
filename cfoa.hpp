@@ -38,6 +38,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include "rw_spinlock.hpp"
 
 #if defined(__SSE2__)||\
     defined(_M_X64)||(defined(_M_IX86_FP)&&_M_IX86_FP>=2)
@@ -1904,14 +1905,14 @@ private:
   static constexpr std::size_t num_mutexes=16;
   struct mutex
   {
-    alignas(64) mutable std::atomic_int mtx=0;
+    alignas(64) mutable rw_spinlock mtx;
   };
 
-  lock<std::atomic_int> access()const
+  std::shared_lock<rw_spinlock> access()const
   {
     thread_local auto id=(++thread_counter)%num_mutexes;
 
-    return {mutexes[id].mtx};
+    return std::shared_lock<rw_spinlock>{mutexes[id].mtx};
   }
 
   auto exclusive_access()const
@@ -1919,7 +1920,10 @@ private:
     return std::apply(
       [](auto&... mtxs)
       {
-        return std::array<lock<std::atomic_int>,num_mutexes>{mtxs.mtx...};
+        return std::array<std::lock_guard<rw_spinlock>,num_mutexes>
+        {
+          std::lock_guard<rw_spinlock>{mtxs.mtx}...
+        };
       },
       mutexes);
   }
