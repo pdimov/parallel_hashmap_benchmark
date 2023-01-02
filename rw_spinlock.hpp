@@ -135,33 +135,35 @@ public:
 
             // clear writer pending bit before going to sleep
 
-            for( ;; )
             {
                 std::uint32_t st = state_.load( std::memory_order_relaxed );
 
-                if( st & 0x8000'0000 )
+                for( ;; )
                 {
-                    // locked exclusive, nothing to do
-                    break;
-                }
-                else if( ( st & 0x3FFF'FFFF ) == 0 )
-                {
-                    // lock free, try to take it
+                    if( st & 0x8000'0000 )
+                    {
+                        // locked exclusive, nothing to do
+                        break;
+                    }
+                    else if( ( st & 0x3FFF'FFFF ) == 0 )
+                    {
+                        // lock free, try to take it
 
-                    std::uint32_t newst = 0x8000'0000;
-                    if( state_.compare_exchange_weak( st, newst, std::memory_order_acquire, std::memory_order_relaxed ) ) return;
-                }
-                else if( ( st & 0x4000'0000 ) == 0 )
-                {
-                    // writer pending bit already clear, nothing to do
-                    break;
-                }
-                else
-                {
-                    // clear writer pending bit
+                        std::uint32_t newst = 0x8000'0000;
+                        if( state_.compare_exchange_weak( st, newst, std::memory_order_acquire, std::memory_order_relaxed ) ) return;
+                    }
+                    else if( ( st & 0x4000'0000 ) == 0 )
+                    {
+                        // writer pending bit already clear, nothing to do
+                        break;
+                    }
+                    else
+                    {
+                        // clear writer pending bit
 
-                    std::uint32_t newst = st & ~0x4000'0000u;
-                    if( state_.compare_exchange_weak( st, newst, std::memory_order_relaxed, std::memory_order_relaxed ) ) break;
+                        std::uint32_t newst = st & ~0x4000'0000u;
+                        if( state_.compare_exchange_weak( st, newst, std::memory_order_relaxed, std::memory_order_relaxed ) ) break;
+                    }
                 }
             }
 
