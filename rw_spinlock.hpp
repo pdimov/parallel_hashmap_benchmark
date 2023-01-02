@@ -23,7 +23,7 @@ private:
 private:
 
     // number of times to spin before sleeping
-    static constexpr int spin_count = 49152;
+    static constexpr int spin_count = 24576;
 
 public:
 
