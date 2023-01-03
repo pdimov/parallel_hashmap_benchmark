@@ -42,6 +42,7 @@
 #include <type_traits>
 #include <utility>
 #include "rw_spinlock.hpp"
+#include "oneapi/tbb/spin_rw_mutex.h"
 
 #if defined(__SSE2__)||\
     defined(_M_X64)||(defined(_M_IX86_FP)&&_M_IX86_FP>=2)
@@ -110,16 +111,19 @@ static const std::size_t default_bucket_count = 0;
 /* copied from https://rigtorp.se/spinlock/ */
 // (not any longer)
 
-template<typename Atomic, typename Atomic::value_type Locked=1>
-inline auto do_lock( Atomic& a )
+template<typename Atomic,typename Atomic::value_type Locked=1>
+class lock
 {
-    constexpr int spin_count = 32768;
+public:
+  using value_type=typename Atomic::value_type;
 
-    typename Atomic::value_type x;
+  lock(Atomic& a_):a{a_}
+  {
+    constexpr int spin_count = 32768;
 
     for(;;)
     {
-      if( (x=a.exchange(Locked,std::memory_order_acquire)) != Locked ) return x;
+      if( (x=a.exchange(Locked,std::memory_order_acquire)) != Locked ) return;
 
       bool locked = true;
 
@@ -139,25 +143,9 @@ inline auto do_lock( Atomic& a )
         boost::detail::sp_thread_sleep();
       }
     }
-}
-
-template<typename Atomic>
-inline auto do_unlock( Atomic& a, typename Atomic::value_type x )
-{
-  a.store(x,std::memory_order_release);
-}
-
-template<typename Atomic,typename Atomic::value_type Locked=1>
-class lock
-{
-public:
-  using value_type=typename Atomic::value_type;
-
-  lock(Atomic& a_):a{a_}, x{do_lock<Atomic,Locked>(a)}
-  {
   }
 
-  ~lock(){ do_unlock(a,x); }
+  ~lock(){a.store(x,std::memory_order_release);}
 
   operator const value_type&()const{return x;}
   lock& operator=(const value_type& x_){x=x_;return *this;}
@@ -513,7 +501,7 @@ inline unsigned int unchecked_countr_zero(int x)
 #endif
 }
 
-template<typename,typename,typename,typename>
+template<typename,typename,typename,typename,typename>
 class table;
 
 /* table_iterator keeps two pointers:
@@ -588,7 +576,7 @@ public:
 
 private:
   template<typename,typename,bool> friend class table_iterator;
-  template<typename,typename,typename,typename> friend class table;
+  template<typename,typename,typename,typename,typename> friend class table;
 
   table_iterator(Group* pg,std::size_t n,const table_element_type* p_):
     pc{reinterpret_cast<unsigned char*>(const_cast<Group*>(pg))+n},
@@ -657,11 +645,6 @@ Group* dummy_groups()
     const_cast<typename Group::dummy_group_type*>(storage));
 }
 
-struct write_mutex
-{
-  alignas(64) std::atomic_int mtx=0;
-};
-
 template<typename Element,typename Group,typename SizePolicy>
 struct table_arrays
 {
@@ -677,7 +660,7 @@ struct table_arrays
 
     auto         groups_size_index=size_index_for<group_type,size_policy>(n);
     auto         groups_size=size_policy::size(groups_size_index);
-    table_arrays arrays{groups_size_index,groups_size-1,nullptr,nullptr};
+    table_arrays arrays{groups_size_index,groups_size-1,nullptr,nullptr,nullptr};
 
     if(!n){
       arrays.groups=dummy_groups<group_type,size_policy::min_size()>();
@@ -700,6 +683,17 @@ struct table_arrays
        */
 
       std::memset(arrays.groups,0,sizeof(group_type)*groups_size);
+
+      using group_counter_allocator_type=
+        allocator_rebind_t<Allocator,std::atomic_size_t>;
+      group_counter_allocator_type cal=al;
+      arrays.group_counters=
+        boost::allocator_traits<group_counter_allocator_type>::allocate(
+          cal,groups_size);
+      for(std::size_t n=0;n<groups_size;++n){
+        boost::allocator_traits<group_counter_allocator_type>::construct(
+          cal,arrays.group_counters+n);
+      }
     }
     return arrays;
   }
@@ -715,6 +709,16 @@ struct table_arrays
       alloc_traits::deallocate(
         al,pointer_traits::pointer_to(*arrays.elements),
         buffer_size(arrays.groups_size_mask+1));
+
+      using group_counter_allocator_type=
+        allocator_rebind_t<Allocator,std::atomic_size_t>;
+      group_counter_allocator_type cal=al;
+      for(std::size_t n=0;n<arrays.groups_size_mask+1;++n){
+        boost::allocator_traits<group_counter_allocator_type>::destroy(
+          cal,arrays.group_counters+n);
+      }
+      boost::allocator_traits<group_counter_allocator_type>::deallocate(
+        cal,arrays.group_counters,arrays.groups_size_mask+1);
     }
   }
 
@@ -734,10 +738,11 @@ struct table_arrays
     return (buffer_bytes+sizeof(element_type)-1)/sizeof(element_type);
   }
 
-  std::size_t   groups_size_index;
-  std::size_t   groups_size_mask;
-  group_type   *groups;
-  element_type *elements;
+  std::size_t         groups_size_index;
+  std::size_t         groups_size_mask;
+  group_type         *groups;
+  element_type       *elements;
+  std::atomic_size_t *group_counters;
 };
 
 struct if_constexpr_void_else{void operator()()const{}};
@@ -922,7 +927,10 @@ _STL_RESTORE_DEPRECATED_WARNING
  */
 constexpr static float const mlf = 0.875f;
 
-template<typename TypePolicy,typename Hash,typename Pred,typename Allocator>
+template<
+  typename TypePolicy,typename Hash,typename Pred,typename Allocator,
+  typename Mutex=rw_spinlock
+>
 class 
 
 #if defined(_MSC_VER)&&_MSC_FULL_VER>=190023918
@@ -977,15 +985,7 @@ public:
     hash_base{empty_init,h_},pred_base{empty_init,pred_},
     allocator_base{empty_init,al_},size_{0},arrays(new_arrays(n)),
     ml{initial_max_load()}
-    {
-      using mutex_allocator_type=allocator_rebind_t<Allocator,write_mutex>;
-      mutex_allocator_type mal=al();
-      write_mutexes=
-        boost::allocator_traits<mutex_allocator_type>::allocate(mal,256);
-      for(std::size_t n=0;n<256;++n){
-        boost::allocator_traits<mutex_allocator_type>::construct(mal,write_mutexes+n);
-      }
-    }
+    {}
 
   table(const table& x):
     table{x,alloc_traits::select_on_container_copy_construction(x.al())}{}
@@ -1039,14 +1039,6 @@ public:
       destroy_element(p);
     });
     delete_arrays(arrays);
-
-    using mutex_allocator_type=allocator_rebind_t<Allocator,write_mutex>;
-    mutex_allocator_type mal=al();
-    for(std::size_t n=0;n<256;++n){
-      boost::allocator_traits<mutex_allocator_type>::destroy(mal,write_mutexes+n);
-    }
-    boost::allocator_traits<mutex_allocator_type>::deallocate(
-      mal,write_mutexes,256);
   }
 
   table& operator=(const table& x)
@@ -1183,6 +1175,7 @@ public:
     for(;;){
       std::size_t n;
       {
+        auto lck=shared_access();
         n=capacity();
         if(emplace_impl(
           f,try_emplace_args_t{},std::forward<Key>(x),std::forward<Args>(args)...))return;
@@ -1303,7 +1296,7 @@ public:
   template<typename Key,typename F>
   BOOST_FORCEINLINE bool find(const Key& x,F f)
   {
-    auto lck=read_access();
+    auto lck=shared_access();
     auto hash=hash_for(x);
     return find_impl(x,f,position_for(hash),hash);
   }
@@ -1350,7 +1343,7 @@ public:
   }
 
 private:
-  template<typename,typename,typename,typename> friend class table;
+  template<typename,typename,typename,typename,typename> friend class table;
   using element_type=typename type_policy::element_type;
   using element_allocator_type=allocator_rebind_t<Allocator,element_type>;
   using arrays_type=table_arrays<element_type,group_type,size_policy>;
@@ -1637,18 +1630,40 @@ private:
     const auto       &k=key_from(std::forward<Args>(args)...);
     auto             hash=hash_for(k);
     auto             pos0=position_for(hash);
-    lock             lck(write_mutexes[group_type::get_reduced_hash(hash)].mtx);
 
-    if(find_impl(
-      k,[&](value_type& x){f(x,false);},pos0,hash))return true;
+    for(;;){
+    startover:;
+      std::size_t group_counter=arrays.group_counters[pos0];
 
-    if(BOOST_LIKELY(size_<ml)){
-      auto it=unchecked_emplace_at(pos0,hash,std::forward<Args>(args)...);
-      f(*it,true);
-      return true;
+      if(find_impl(
+        k,[&](value_type& x){f(x,false);},pos0,hash))return true;
+
+      if(BOOST_LIKELY(size_<ml)){
+        for(prober pb(pos0);;pb.next(arrays.groups_size_mask)){
+          auto pos=pb.get();
+          auto pg=arrays.groups+pos;
+          for(;;){
+            auto mask=pg->match_available();
+            if(BOOST_UNLIKELY(mask==0))break;
+            auto n=unchecked_countr_zero(mask);
+            auto c=pg->acquire(n);
+            if(BOOST_UNLIKELY(c!=0))continue;
+            if(BOOST_UNLIKELY(++arrays.group_counters[pos0]!=group_counter+1)){
+              /* some other thread inserted from p0, need to start over */
+              goto startover;
+            }
+            auto p=arrays.elements+pos*N+n;
+            construct_element(p,std::forward<Args>(args)...);
+            c=group_type::get_reduced_hash(hash);
+            ++size_;
+            f(*p,true);
+            return true;
+          }
+          pg->mark_overflow(hash);
+        }
+      }
+      else return false;
     }
-
-    return false;
   }
 
   static std::size_t capacity_for(std::size_t n)
@@ -1901,46 +1916,42 @@ private:
   arrays_type              arrays;
   std::atomic<std::size_t> ml;
 
+  using mutex_type=Mutex;
   static constexpr std::size_t num_mutexes=128;
-  struct mutex
+  struct aligned_mutex
   {
-    alignas(64) mutable rw_spinlock mtx;
+    alignas(64) mutable mutex_type mtx;
   };
 
-  std::shared_lock<rw_spinlock> read_access()const
+  std::shared_lock<mutex_type> shared_access()const
   {
     thread_local auto id=(++thread_counter)%num_mutexes;
 
-    return std::shared_lock<rw_spinlock>{mutexes[id].mtx};
+    return std::shared_lock<mutex_type>{mutexes[id].mtx};
   }
 
   struct exclusive_access_struct
   {
-    exclusive_access_struct(const mutex* mutexes_,write_mutex* write_mutexes_):
-     mutexes{mutexes_},write_mutexes{write_mutexes_}
+    exclusive_access_struct(const aligned_mutex* mutexes_):mutexes{mutexes_}
     {
       for(int i=0;i<num_mutexes;)mutexes[i++].mtx.lock();
-      for(int i=0;i<256;)do_lock(write_mutexes[i++].mtx);
     }
 
     ~exclusive_access_struct()
     {
-      for(int i=256;i>0;)do_unlock(write_mutexes[--i].mtx,0);
       for(int i=num_mutexes;i>0;)mutexes[--i].mtx.unlock();
     }
 
-    const mutex* mutexes;
-    write_mutex* write_mutexes;
+    const aligned_mutex* mutexes;
   };
 
   auto exclusive_access()const
   {
-    return exclusive_access_struct(mutexes.data(),write_mutexes);
+    return exclusive_access_struct(mutexes.data());
   }
 
-  mutable std::atomic_uint      thread_counter=0;
-  std::array<mutex,num_mutexes> mutexes;
-  write_mutex                  *write_mutexes;
+  mutable std::atomic_uint              thread_counter=0;
+  std::array<aligned_mutex,num_mutexes> mutexes;
 };
 
 #if BOOST_WORKAROUND(BOOST_MSVC,<=1900)
