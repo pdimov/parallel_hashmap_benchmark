@@ -66,17 +66,10 @@ public:
     {
         // pre: locked shared, not locked exclusive
 
-        std::uint32_t st = state_.fetch_sub( 1, std::memory_order_release ) - 1;
+        state_.fetch_sub( 1, std::memory_order_release );
 
-        for( ;; )
-        {
-            // if we were the last reader, we need to clear the writer pending bit
-
-            if( st != 0x4000'0000 ) break;
-
-            std::uint32_t newst = 0;
-            if( state_.compare_exchange_weak( st, newst, std::memory_order_relaxed, std::memory_order_relaxed ) ) break;
-        }
+        // if the writer pending bit is set, there's a writer waiting
+        // let it acquire the lock; it will clear the bit on unlock
     }
 
     bool try_lock() noexcept
