@@ -27,8 +27,8 @@
 #include "oneapi/tbb/concurrent_hash_map.h"
 #include "gtl/phmap.hpp"
 
-int const Th = 48; // number of threads
-int const Sh = Th * Th; // number of shards
+int const Th = 24; // number of threads
+int const Sh = 512; // number of shards
 
 using namespace std::chrono_literals;
 
@@ -140,7 +140,7 @@ struct tbb_hash_compare
 
 using tbb_map_type = tbb::concurrent_hash_map<std::string_view, std::size_t, tbb_hash_compare>;
 
-template<class Mutex> using gtl_map_type = gtl::parallel_flat_hash_map<std::string_view, std::size_t, boost::hash<std::string_view>, std::equal_to<std::string_view>, std::allocator<std::pair<const std::string_view, int>>, 6, Mutex>;
+template<class Mutex> using gtl_map_type = gtl::parallel_flat_hash_map<std::string_view, std::size_t, boost::hash<std::string_view>, std::equal_to<std::string_view>, std::allocator<std::pair<const std::string_view, int>>, 9, Mutex>;
 
 // map operations
 
@@ -993,15 +993,15 @@ int main()
     test<single_threaded<ufm_map_type, rw_spinlock>>( "boost::unordered_flat_map, single threaded, rw_spinlock" );
     test<single_threaded<cfoa_map_type>>( "concurrent_foa, single threaded" );
     // test<single_threaded<cuckoo_map_type>>( "libcuckoo::cuckoohash_map, single threaded" );
-    // test<single_threaded<tbb_map_type>>( "tbb::concurrent_hash_map, single threaded" );
+    test<single_threaded<tbb_map_type>>( "tbb::concurrent_hash_map, single threaded" );
     // test<single_threaded<gtl_map_type<rw_spinlock>>>( "gtl::parallel_flat_hash_map<rw_spinlock>, single threaded" );
 
     // test<ufm_locked<std::mutex>>( "boost::unordered_flat_map, locked<mutex>" );
     // test<ufm_locked<std::shared_mutex>>( "boost::unordered_flat_map, locked<shared_mutex>" );
-    test<ufm_locked<rw_spinlock>>( "boost::unordered_flat_map, locked<rw_spinlock>" );
+    // test<ufm_locked<rw_spinlock>>( "boost::unordered_flat_map, locked<rw_spinlock>" );
 
     // test<ufm_sharded<std::mutex>>( "boost::unordered_flat_map, sharded<mutex>" );
-    // test<ufm_sharded_prehashed<std::mutex>>( "boost::unordered_flat_map, sharded_prehashed<mutex>" );
+    test<ufm_sharded_prehashed<std::mutex>>( "boost::unordered_flat_map, sharded_prehashed<mutex>" );
     // test<ufm_sharded<std::shared_mutex>>("boost::unordered_flat_map, sharded<shared_mutex>");
     test<ufm_sharded_prehashed<std::shared_mutex>>( "boost::unordered_flat_map, sharded_prehashed<shared_mutex>" );
     // test<ufm_sharded<rw_spinlock>>( "boost::unordered_flat_map, sharded<rw_spinlock>" );
