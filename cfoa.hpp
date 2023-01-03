@@ -28,6 +28,8 @@
 #include <boost/unordered/detail/narrow_cast.hpp>
 #include <boost/unordered/detail/xmx.hpp>
 #include <boost/unordered/hash_traits.hpp>
+#include <boost/smart_ptr/detail/sp_thread_pause.hpp>
+#include <boost/smart_ptr/detail/sp_thread_sleep.hpp>
 #include <climits>
 #include <cmath>
 #include <cstddef>
@@ -105,6 +107,7 @@ static const std::size_t default_bucket_count = 0;
  */
 
 /* copied from https://rigtorp.se/spinlock/ */
+// (not any longer)
 
 template<typename Atomic,typename Atomic::value_type Locked=1>
 class lock
@@ -114,11 +117,28 @@ public:
 
   lock(Atomic& a_):a{a_}
   {
-    for(;;){
-      if((x=a.exchange(Locked,std::memory_order_acquire))!=Locked)return;
+    constexpr int spin_count = 32768;
 
-      while(a.load(std::memory_order_relaxed)==Locked){
-        _mm_pause();
+    for(;;)
+    {
+      if( (x=a.exchange(Locked,std::memory_order_acquire)) != Locked ) return;
+
+      bool locked = true;
+
+      for( int k = 0; k < spin_count; ++k )
+      {
+        if( a.load( std::memory_order_relaxed ) != Locked )
+        {
+          locked = false;
+          break;
+        }
+
+        boost::detail::sp_thread_pause();
+      }
+
+      if( locked )
+      {
+        boost::detail::sp_thread_sleep();
       }
     }
   }
