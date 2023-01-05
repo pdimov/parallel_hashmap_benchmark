@@ -123,6 +123,21 @@ public:
 
     for(;;)
     {
+#if 1
+      start:;
+
+      if( (x=a.exchange(Locked,std::memory_order_acquire)) != Locked ) return;
+
+
+      for( int k = 0; k < spin_count; ++k )
+      {
+        if( a.load( std::memory_order_relaxed ) != Locked ) goto start;
+        boost::detail::sp_thread_pause();
+      }
+
+      boost::detail::sp_thread_sleep();
+    }
+#else
       if( (x=a.exchange(Locked,std::memory_order_acquire)) != Locked ) return;
 
       bool locked = true;
@@ -143,6 +158,7 @@ public:
         boost::detail::sp_thread_sleep();
       }
     }
+#endif
   }
 
   ~lock(){a.store(x,std::memory_order_release);}
@@ -249,13 +265,14 @@ struct group15
 
   inline int match(std::size_t hash)const
   {
+    static const auto locked_word=_mm_set1_epi8(locked_);
     auto w=_mm_load_si128(reinterpret_cast<const __m128i*>(m));
-    std::atomic_thread_fence(std::memory_order_acquire); // TODO WHY O WHY
+    //std::atomic_thread_fence(std::memory_order_acquire); // TODO WHY O WHY
     //_mm_lfence();
     //_mm_mfence();
     return
       (_mm_movemask_epi8(_mm_cmpeq_epi8(w,_mm_set1_epi32(match_word(hash))))|
-       _mm_movemask_epi8(_mm_cmpeq_epi8(w,_mm_set1_epi8(locked_))))&0x7FFF;
+       _mm_movemask_epi8(_mm_cmpeq_epi8(w,locked_word)))&0x7FFF;
   }
 
   inline bool is_not_overflowed(std::size_t hash)const
@@ -1602,12 +1619,14 @@ private:
         prefetch_elements(p);
         do{
           auto n=unchecked_countr_zero(mask);
-          auto c=pg->acquire(n);
-          if(BOOST_LIKELY(
-            c!=0&&
-            bool(pred()(x,key_from(p[n]))))){
-            f(p[n]);
-            return true;
+          {
+            auto c=pg->acquire(n);
+            if(BOOST_LIKELY(
+              c!=0&&
+              bool(pred()(x,key_from(p[n]))))){
+              f(p[n]);
+              return true;
+            }
           }
           mask&=mask-1;
         }while(mask);
