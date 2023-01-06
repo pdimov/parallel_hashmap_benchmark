@@ -44,6 +44,8 @@
 #include "rw_spinlock.hpp"
 #include "oneapi/tbb/spin_rw_mutex.h"
 
+#define EMBEDDED_COUNTER 1
+
 #if defined(__SSE2__)||\
     defined(_M_X64)||(defined(_M_IX86_FP)&&_M_IX86_FP>=2)
 #define BOOST_UNORDERED_SSE2
@@ -225,6 +227,9 @@ struct group15
   {
     alignas(16) std::atomic<unsigned char> storage[N+1]=
       {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+#if EMBEDDED_COUNTER
+    std::atomic_uint16_t counter;
+#endif
   };
 
   inline void initialize()
@@ -378,6 +383,10 @@ private:
   }
 
   alignas(16) std::atomic<unsigned char> m[16];
+#if EMBEDDED_COUNTER
+public:
+    std::atomic_uint16_t counter;
+#endif
 };
 
 #elif defined(BOOST_UNORDERED_LITTLE_ENDIAN_NEON)
@@ -677,7 +686,11 @@ struct table_arrays
 
     auto         groups_size_index=size_index_for<group_type,size_policy>(n);
     auto         groups_size=size_policy::size(groups_size_index);
+#if EMBEDDED_COUNTER
+    table_arrays arrays{groups_size_index,groups_size-1,nullptr,nullptr};
+#else
     table_arrays arrays{groups_size_index,groups_size-1,nullptr,nullptr,nullptr};
+#endif
 
     if(!n){
       arrays.groups=dummy_groups<group_type,size_policy::min_size()>();
@@ -701,8 +714,9 @@ struct table_arrays
 
       std::memset(arrays.groups,0,sizeof(group_type)*groups_size);
 
+#if !EMBEDDED_COUNTER
       using group_counter_allocator_type=
-        allocator_rebind_t<Allocator,std::atomic_size_t>;
+        allocator_rebind_t<Allocator,std::atomic_uint16_t>;
       group_counter_allocator_type cal=al;
       arrays.group_counters=
         boost::allocator_traits<group_counter_allocator_type>::allocate(
@@ -711,6 +725,7 @@ struct table_arrays
         boost::allocator_traits<group_counter_allocator_type>::construct(
           cal,arrays.group_counters+n);
       }
+#endif
     }
     return arrays;
   }
@@ -727,8 +742,9 @@ struct table_arrays
         al,pointer_traits::pointer_to(*arrays.elements),
         buffer_size(arrays.groups_size_mask+1));
 
+#if !EMBEDDED_COUNTER
       using group_counter_allocator_type=
-        allocator_rebind_t<Allocator,std::atomic_size_t>;
+        allocator_rebind_t<Allocator,std::atomic_uint16_t>;
       group_counter_allocator_type cal=al;
       for(std::size_t n=0;n<arrays.groups_size_mask+1;++n){
         boost::allocator_traits<group_counter_allocator_type>::destroy(
@@ -736,6 +752,7 @@ struct table_arrays
       }
       boost::allocator_traits<group_counter_allocator_type>::deallocate(
         cal,arrays.group_counters,arrays.groups_size_mask+1);
+#endif
     }
   }
 
@@ -755,11 +772,14 @@ struct table_arrays
     return (buffer_bytes+sizeof(element_type)-1)/sizeof(element_type);
   }
 
-  std::size_t         groups_size_index;
-  std::size_t         groups_size_mask;
-  group_type         *groups;
-  element_type       *elements;
-  std::atomic_size_t *group_counters;
+  std::size_t           groups_size_index;
+  std::size_t           groups_size_mask;
+  group_type           *groups;
+  element_type         *elements;
+
+#if !EMBEDDED_COUNTER
+  std::atomic_uint16_t *group_counters;
+#endif
 };
 
 struct if_constexpr_void_else{void operator()()const{}};
@@ -1652,8 +1672,11 @@ private:
 
     for(;;){
     startover:;
-      std::size_t group_counter=arrays.group_counters[pos0];
-
+#if EMBEDDED_COUNTER
+      boost::uint16_t group_counter=arrays.groups[pos0].counter;
+#else
+      boost::uint16_t group_counter=arrays.group_counters[pos0];
+#endif
       if(find_impl(
         k,[&](value_type& x){f(x,false);},pos0,hash))return true;
 
@@ -1661,13 +1684,45 @@ private:
         for(prober pb(pos0);;pb.next(arrays.groups_size_mask)){
           auto pos=pb.get();
           auto pg=arrays.groups+pos;
+#if 1
+          auto mask=pg->match_available();
+          if(BOOST_LIKELY(mask!=0)){
+            do{
+              auto n=unchecked_countr_zero(mask);
+              {
+                auto c=pg->acquire(n);
+                if(BOOST_LIKELY(c==0)){
+#if EMBEDDED_COUNTER
+                  if(BOOST_UNLIKELY(arrays.groups[pos0].counter++!=group_counter)){
+#else
+                  if(BOOST_UNLIKELY(arrays.group_counters[pos0]++!=group_counter)){
+#endif
+                    /* some other thread inserted from p0, need to start over */
+                    goto startover;
+                  }
+                  auto p=arrays.elements+pos*N+n;
+                  construct_element(p,std::forward<Args>(args)...);
+                  c=group_type::get_reduced_hash(hash);
+                  ++size_;
+                  f(*p,true);
+                  return true;
+                }
+              }
+              mask&=mask-1;
+            }while(mask);
+          }
+#else
           for(;;){
             auto mask=pg->match_available();
             if(BOOST_UNLIKELY(mask==0))break;
             auto n=unchecked_countr_zero(mask);
             auto c=pg->acquire(n);
             if(BOOST_UNLIKELY(c!=0))continue;
-            if(BOOST_UNLIKELY(++arrays.group_counters[pos0]!=group_counter+1)){
+#if EMBEDDED_COUNTER
+            if(BOOST_UNLIKELY(arrays.groups[pos0].counter++!=group_counter)){
+#else
+            if(BOOST_UNLIKELY(arrays.group_counters[pos0]++!=group_counter)){
+#endif
               /* some other thread inserted from p0, need to start over */
               goto startover;
             }
@@ -1678,6 +1733,7 @@ private:
             f(*p,true);
             return true;
           }
+#endif
           pg->mark_overflow(hash);
         }
       }
@@ -1944,7 +2000,9 @@ private:
 
   std::shared_lock<mutex_type> shared_access()const
   {
-    thread_local auto id=(++thread_counter)%num_mutexes;
+    static std::atomic_uint thread_counter=0;
+    thread_local auto       id=(++thread_counter)%num_mutexes;
+    //auto id=std::hash<std::thread::id>()(std::this_thread::get_id())%num_mutexes;
 
     return std::shared_lock<mutex_type>{mutexes[id].mtx};
   }
@@ -1969,7 +2027,7 @@ private:
     return exclusive_access_struct(mutexes.data());
   }
 
-  mutable std::atomic_uint              thread_counter=0;
+  //mutable std::atomic_uint              thread_counter=0;
   std::array<aligned_mutex,num_mutexes> mutexes;
 };
 
