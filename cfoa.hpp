@@ -37,6 +37,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <tuple>
 #include <type_traits>
@@ -44,7 +45,6 @@
 #include "rw_spinlock.hpp"
 #include "oneapi/tbb/spin_rw_mutex.h"
 
-#define EMBEDDED_COUNTER 1
 
 #if defined(__SSE2__)||\
     defined(_M_X64)||(defined(_M_IX86_FP)&&_M_IX86_FP>=2)
@@ -110,69 +110,6 @@ static const std::size_t default_bucket_count = 0;
  *     operations.
  */
 
-/* copied from https://rigtorp.se/spinlock/ */
-// (not any longer)
-
-template<typename Atomic,typename Atomic::value_type Locked=1>
-class lock
-{
-public:
-  using value_type=typename Atomic::value_type;
-
-  lock(Atomic& a_):a{a_}
-  {
-    constexpr int spin_count = 32768;
-
-    for(;;)
-    {
-#if 1
-      start:;
-
-      if( (x=a.exchange(Locked,std::memory_order_acquire)) != Locked ) return;
-
-
-      for( int k = 0; k < spin_count; ++k )
-      {
-        if( a.load( std::memory_order_relaxed ) != Locked ) goto start;
-        boost::detail::sp_thread_pause();
-      }
-
-      boost::detail::sp_thread_sleep();
-    }
-#else
-      if( (x=a.exchange(Locked,std::memory_order_acquire)) != Locked ) return;
-
-      bool locked = true;
-
-      for( int k = 0; k < spin_count; ++k )
-      {
-        if( a.load( std::memory_order_relaxed ) != Locked )
-        {
-          locked = false;
-          break;
-        }
-
-        boost::detail::sp_thread_pause();
-      }
-
-      if( locked )
-      {
-        boost::detail::sp_thread_sleep();
-      }
-    }
-#endif
-  }
-
-  ~lock(){a.store(x,std::memory_order_release);}
-
-  operator const value_type&()const{return x;}
-  lock& operator=(const value_type& x_){x=x_;return *this;}
-
-private:
-  Atomic&    a;
-  value_type x;
-};
-
 /* group15 controls metadata information of a group of N=15 element slots.
  * The 16B metadata word is organized as follows (LSB depicted rightmost):
  *
@@ -225,11 +162,9 @@ struct group15
 
   struct dummy_group_type
   {
-    alignas(16) std::atomic<unsigned char> storage[N+1]=
+    alignas(16) unsigned char storage[N+1]=
       {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-#if EMBEDDED_COUNTER
-    std::atomic_uint16_t counter;
-#endif
+    boost::uint32_t mtx_storage=0,counter_storage=0;
   };
 
   inline void initialize()
@@ -238,24 +173,31 @@ struct group15
       reinterpret_cast<__m128i*>(m),_mm_setzero_si128());
   }
 
-  inline auto acquire(std::size_t pos)
+  inline auto shared_access()
   {
-    BOOST_ASSERT(pos<N);
-    return lock<std::atomic<unsigned char>,locked_>(at(pos));
+    return std::shared_lock<rw_spinlock>(mtx);
   }
 
-  static inline unsigned char get_reduced_hash(std::size_t hash)
+  inline auto exclusive_access()
   {
-    return reduced_hash(hash);
+    return std::scoped_lock<rw_spinlock>(mtx);
   }
 
-#if 0
+  inline std::atomic_uchar& at(std::size_t pos)
+  {
+    return m[pos];
+  }
+
+  inline const std::atomic_uchar& at(std::size_t pos)const
+  {
+    return m[pos];
+  }
+
   inline void set(std::size_t pos,std::size_t hash)
   {
     BOOST_ASSERT(pos<N);
     at(pos)=reduced_hash(hash);
   }
-#endif
 
   inline void reset(std::size_t pos)
   {
@@ -270,14 +212,10 @@ struct group15
 
   inline int match(std::size_t hash)const
   {
-    static const auto locked_word=_mm_set1_epi8(locked_);
     auto w=_mm_load_si128(reinterpret_cast<const __m128i*>(m));
-    //std::atomic_thread_fence(std::memory_order_acquire); // TODO WHY O WHY
-    //_mm_lfence();
-    //_mm_mfence();
+    //std::atomic_thread_fence(std::memory_order_acquire);
     return
-      (_mm_movemask_epi8(_mm_cmpeq_epi8(w,_mm_set1_epi32(match_word(hash))))|
-       _mm_movemask_epi8(_mm_cmpeq_epi8(w,locked_word)))&0x7FFF;
+      _mm_movemask_epi8(_mm_cmpeq_epi8(w,_mm_set1_epi32(match_word(hash))))&0x7FFF;
   }
 
   inline bool is_not_overflowed(std::size_t hash)const
@@ -301,10 +239,10 @@ struct group15
 
   inline int match_available()const
   {
+    auto w=_mm_load_si128(reinterpret_cast<const __m128i*>(m));
+    //std::atomic_thread_fence(std::memory_order_acquire);
     return _mm_movemask_epi8(
-      _mm_cmpeq_epi8(
-        _mm_load_si128(reinterpret_cast<const __m128i*>(m)),
-        _mm_setzero_si128()))&0x7FFF;
+      _mm_cmpeq_epi8(w,_mm_setzero_si128()))&0x7FFF;
   }
 
   inline int match_occupied()const
@@ -314,7 +252,7 @@ struct group15
 
 private:
   static constexpr unsigned char available_=0,
-                                 locked_=1;
+                                 sentinel_=1;
 
   inline static int match_word(std::size_t hash)
   {
@@ -362,31 +300,20 @@ private:
     return narrow_cast<unsigned char>(match_word(hash));
   }
 
-  inline std::atomic<unsigned char>& at(std::size_t pos)
-  {
-    return m[pos];
-  }
-
-  inline const std::atomic<unsigned char>& at(std::size_t pos)const
-  {
-    return m[pos];
-  }
-
-  inline std::atomic<unsigned char>& overflow()
+  inline std::atomic_uchar& overflow()
   {
     return at(N);
   }
 
-  inline const std::atomic<unsigned char>& overflow()const
+  inline const std::atomic_uchar& overflow()const
   {
     return at(N);
   }
 
-  alignas(16) std::atomic<unsigned char> m[16];
-#if EMBEDDED_COUNTER
+  alignas(16) std::atomic_uchar m[16];
+  rw_spinlock                   mtx;
 public:
-    std::atomic_uint16_t counter;
-#endif
+  std::atomic_uint32_t          counter;
 };
 
 #elif defined(BOOST_UNORDERED_LITTLE_ENDIAN_NEON)
@@ -1637,16 +1564,14 @@ private:
       if(mask){
         auto p=arrays.elements+pos*N;
         prefetch_elements(p);
+        auto lck=pg->shared_access();
         do{
           auto n=unchecked_countr_zero(mask);
-          {
-            auto c=pg->acquire(n);
-            if(BOOST_LIKELY(
-              c!=0&&
-              bool(pred()(x,key_from(p[n]))))){
-              f(p[n]);
-              return true;
-            }
+          if(
+            pg->at(n)!=0&&
+            BOOST_LIKELY(bool(pred()(x,key_from(p[n]))))){
+            f(p[n]);
+            return true;
           }
           mask&=mask-1;
         }while(mask);
@@ -1672,11 +1597,7 @@ private:
 
     for(;;){
     startover:;
-#if EMBEDDED_COUNTER
-      boost::uint16_t group_counter=arrays.groups[pos0].counter;
-#else
-      boost::uint16_t group_counter=arrays.group_counters[pos0];
-#endif
+      boost::uint32_t group_counter=arrays.groups[pos0].counter;
       if(find_impl(
         k,[&](value_type& x){f(x,false);},pos0,hash))return true;
 
@@ -1684,56 +1605,27 @@ private:
         for(prober pb(pos0);;pb.next(arrays.groups_size_mask)){
           auto pos=pb.get();
           auto pg=arrays.groups+pos;
-#if 1
           auto mask=pg->match_available();
           if(BOOST_LIKELY(mask!=0)){
+            auto lck=pg->exclusive_access();
             do{
               auto n=unchecked_countr_zero(mask);
-              {
-                auto c=pg->acquire(n);
-                if(BOOST_LIKELY(c==0)){
-#if EMBEDDED_COUNTER
-                  if(BOOST_UNLIKELY(arrays.groups[pos0].counter++!=group_counter)){
-#else
-                  if(BOOST_UNLIKELY(arrays.group_counters[pos0]++!=group_counter)){
-#endif
-                    /* some other thread inserted from p0, need to start over */
-                    goto startover;
-                  }
-                  auto p=arrays.elements+pos*N+n;
-                  construct_element(p,std::forward<Args>(args)...);
-                  c=group_type::get_reduced_hash(hash);
-                  ++size_;
-                  f(*p,true);
-                  return true;
+              if(pg->at(n)==0){
+                pg->set(n,hash);
+                if(BOOST_UNLIKELY(arrays.groups[pos0].counter++!=group_counter)){
+                  /* some other thread inserted from p0, need to start over */
+                  pg->reset(n);
+                  goto startover;
                 }
+                auto p=arrays.elements+pos*N+n;
+                construct_element(p,std::forward<Args>(args)...);
+                ++size_;
+                f(*p,true);
+                return true;
               }
               mask&=mask-1;
             }while(mask);
           }
-#else
-          for(;;){
-            auto mask=pg->match_available();
-            if(BOOST_UNLIKELY(mask==0))break;
-            auto n=unchecked_countr_zero(mask);
-            auto c=pg->acquire(n);
-            if(BOOST_UNLIKELY(c!=0))continue;
-#if EMBEDDED_COUNTER
-            if(BOOST_UNLIKELY(arrays.groups[pos0].counter++!=group_counter)){
-#else
-            if(BOOST_UNLIKELY(arrays.group_counters[pos0]++!=group_counter)){
-#endif
-              /* some other thread inserted from p0, need to start over */
-              goto startover;
-            }
-            auto p=arrays.elements+pos*N+n;
-            construct_element(p,std::forward<Args>(args)...);
-            c=group_type::get_reduced_hash(hash);
-            ++size_;
-            f(*p,true);
-            return true;
-          }
-#endif
           pg->mark_overflow(hash);
         }
       }
@@ -1912,12 +1804,9 @@ private:
         auto mask=pg->match_available();
         if(BOOST_UNLIKELY(mask==0))break;
         auto n=unchecked_countr_zero(mask);
-        auto c=pg->acquire(n);
-        if(BOOST_UNLIKELY(c!=0))continue;
         auto p=arrays_.elements+pos*N+n;
         construct_element(p,std::forward<Args>(args)...);
-        //pg->set(n,hash);
-        c=group_type::get_reduced_hash(hash);
+        pg->set(n,hash);
         return {pg,n,p};
       }
       pg->mark_overflow(hash);
@@ -2000,9 +1889,8 @@ private:
 
   std::shared_lock<mutex_type> shared_access()const
   {
-    static std::atomic_uint thread_counter=0;
     thread_local auto       id=(++thread_counter)%num_mutexes;
-    //auto id=std::hash<std::thread::id>()(std::this_thread::get_id())%num_mutexes;
+    //thread_local auto id=std::hash<std::thread::id>()(std::this_thread::get_id())%num_mutexes;
 
     return std::shared_lock<mutex_type>{mutexes[id].mtx};
   }
@@ -2027,7 +1915,7 @@ private:
     return exclusive_access_struct(mutexes.data());
   }
 
-  //mutable std::atomic_uint              thread_counter=0;
+  mutable std::atomic_uint              thread_counter=0;
   std::array<aligned_mutex,num_mutexes> mutexes;
 };
 
