@@ -45,7 +45,6 @@
 #include "rw_spinlock.hpp"
 #include "oneapi/tbb/spin_rw_mutex.h"
 
-
 #if defined(__SSE2__)||\
     defined(_M_X64)||(defined(_M_IX86_FP)&&_M_IX86_FP>=2)
 #define BOOST_UNORDERED_SSE2
@@ -152,6 +151,40 @@ static const std::size_t default_bucket_count = 0;
  * metadata to all zeros.
  */
 
+struct group_access
+{
+  struct dummy_group_access_type
+  {
+    boost::uint32_t storage[2]={0,0};
+  };
+
+  inline auto shared_access()
+  {
+    return std::shared_lock<rw_spinlock>(mtx);
+  }
+
+  inline auto exclusive_access()
+  {
+    return std::scoped_lock<rw_spinlock>(mtx);
+  }
+
+  inline auto& counter(){return cnt;}
+
+private:
+  rw_spinlock          mtx;
+  std::atomic_uint32_t cnt;
+};
+
+template<typename Group>
+struct protected_group:Group,group_access
+{
+  struct dummy_group_type
+  {
+    typename Group::dummy_group_type      group_storage;
+    group_access::dummy_group_access_type access_storage;
+  };
+};
+
 #if defined(BOOST_UNORDERED_SSE2)
 
 static_assert(sizeof(std::atomic<unsigned char>)==1);
@@ -164,23 +197,12 @@ struct group15
   {
     alignas(16) unsigned char storage[N+1]=
       {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-    boost::uint32_t mtx_storage=0,counter_storage=0;
   };
 
   inline void initialize()
   {
     _mm_store_si128(
       reinterpret_cast<__m128i*>(m),_mm_setzero_si128());
-  }
-
-  inline auto shared_access()
-  {
-    return std::shared_lock<rw_spinlock>(mtx);
-  }
-
-  inline auto exclusive_access()
-  {
-    return std::scoped_lock<rw_spinlock>(mtx);
   }
 
   inline std::atomic_uchar& at(std::size_t pos)
@@ -213,7 +235,6 @@ struct group15
   inline int match(std::size_t hash)const
   {
     auto w=_mm_load_si128(reinterpret_cast<const __m128i*>(m));
-    //std::atomic_thread_fence(std::memory_order_acquire);
     return
       _mm_movemask_epi8(_mm_cmpeq_epi8(w,_mm_set1_epi32(match_word(hash))))&0x7FFF;
   }
@@ -240,7 +261,6 @@ struct group15
   inline int match_available()const
   {
     auto w=_mm_load_si128(reinterpret_cast<const __m128i*>(m));
-    //std::atomic_thread_fence(std::memory_order_acquire);
     return _mm_movemask_epi8(
       _mm_cmpeq_epi8(w,_mm_setzero_si128()))&0x7FFF;
   }
@@ -311,9 +331,6 @@ private:
   }
 
   alignas(16) std::atomic_uchar m[16];
-  rw_spinlock                   mtx;
-public:
-  std::atomic_uint32_t          counter;
 };
 
 #elif defined(BOOST_UNORDERED_LITTLE_ENDIAN_NEON)
@@ -602,7 +619,7 @@ template<typename Element,typename Group,typename SizePolicy>
 struct table_arrays
 {
   using element_type=Element;
-  using group_type=Group;
+  using group_type=protected_group<Group>;
   static constexpr auto N=group_type::N;
   using size_policy=SizePolicy;
 
@@ -613,7 +630,7 @@ struct table_arrays
 
     auto         groups_size_index=size_index_for<group_type,size_policy>(n);
     auto         groups_size=size_policy::size(groups_size_index);
-#if EMBEDDED_COUNTER
+#ifdef CFOA_EMBEDDED_GROUP_ACCESS
     table_arrays arrays{groups_size_index,groups_size-1,nullptr,nullptr};
 #else
     table_arrays arrays{groups_size_index,groups_size-1,nullptr,nullptr,nullptr};
@@ -641,16 +658,16 @@ struct table_arrays
 
       std::memset(arrays.groups,0,sizeof(group_type)*groups_size);
 
-#if !EMBEDDED_COUNTER
-      using group_counter_allocator_type=
-        allocator_rebind_t<Allocator,std::atomic_uint16_t>;
-      group_counter_allocator_type cal=al;
-      arrays.group_counters=
-        boost::allocator_traits<group_counter_allocator_type>::allocate(
-          cal,groups_size);
+#ifndef CFOA_EMBEDDED_GROUP_ACCESS
+      using group_access_allocator_type=
+        allocator_rebind_t<Allocator,group_access>;
+      group_access_allocator_type aal=al;
+      arrays.group_accesses=
+        boost::allocator_traits<group_access_allocator_type>::allocate(
+          aal,groups_size);
       for(std::size_t n=0;n<groups_size;++n){
-        boost::allocator_traits<group_counter_allocator_type>::construct(
-          cal,arrays.group_counters+n);
+        boost::allocator_traits<group_access_allocator_type>::construct(
+          aal,arrays.group_accesses+n);
       }
 #endif
     }
@@ -669,16 +686,16 @@ struct table_arrays
         al,pointer_traits::pointer_to(*arrays.elements),
         buffer_size(arrays.groups_size_mask+1));
 
-#if !EMBEDDED_COUNTER
-      using group_counter_allocator_type=
-        allocator_rebind_t<Allocator,std::atomic_uint16_t>;
-      group_counter_allocator_type cal=al;
+#ifndef CFOA_EMBEDDED_GROUP_ACCESS
+      using group_access_allocator_type=
+        allocator_rebind_t<Allocator,group_access>;
+      group_access_allocator_type aal=al;
       for(std::size_t n=0;n<arrays.groups_size_mask+1;++n){
-        boost::allocator_traits<group_counter_allocator_type>::destroy(
-          cal,arrays.group_counters+n);
+        boost::allocator_traits<group_access_allocator_type>::destroy(
+          aal,arrays.group_accesses+n);
       }
-      boost::allocator_traits<group_counter_allocator_type>::deallocate(
-        cal,arrays.group_counters,arrays.groups_size_mask+1);
+      boost::allocator_traits<group_access_allocator_type>::deallocate(
+        aal,arrays.group_accesses,arrays.groups_size_mask+1);
 #endif
     }
   }
@@ -699,13 +716,13 @@ struct table_arrays
     return (buffer_bytes+sizeof(element_type)-1)/sizeof(element_type);
   }
 
-  std::size_t           groups_size_index;
-  std::size_t           groups_size_mask;
-  group_type           *groups;
-  element_type         *elements;
+  std::size_t   groups_size_index;
+  std::size_t   groups_size_mask;
+  group_type   *groups;
+  element_type *elements;
 
-#if !EMBEDDED_COUNTER
-  std::atomic_uint16_t *group_counters;
+#ifndef CFOA_EMBEDDED_GROUP_ACCESS
+  group_access *group_accesses;
 #endif
 };
 
@@ -1325,6 +1342,39 @@ private:
   Allocator&       al(){return allocator_base::get();}
   const Allocator& al()const{return allocator_base::get();}
 
+
+#ifdef CFOA_EMBEDDED_GROUP_ACCESS
+  inline auto shared_access(std::size_t pos)const
+  {
+    return arrays.groups[pos].shared_access();
+  }
+
+  inline auto exclusive_access(std::size_t pos)const
+  {
+    return arrays.groups[pos].exclusive_access();
+  }
+
+  inline auto& counter(std::size_t pos)const
+  {
+    return arrays.groups[pos].counter();
+  }
+#else
+  inline auto shared_access(std::size_t pos)const
+  {
+    return arrays.group_accesses[pos].shared_access();
+  }
+
+  inline auto exclusive_access(std::size_t pos)const
+  {
+    return arrays.group_accesses[pos].exclusive_access();
+  }
+
+  inline auto& counter(std::size_t pos)const
+  {
+    return arrays.group_accesses[pos].counter();
+  }
+#endif
+
   arrays_type new_arrays(std::size_t n)
   {
     element_allocator_type eal=al();
@@ -1564,7 +1614,7 @@ private:
       if(mask){
         auto p=arrays.elements+pos*N;
         prefetch_elements(p);
-        auto lck=pg->shared_access();
+        auto lck=shared_access(pos);
         do{
           auto n=unchecked_countr_zero(mask);
           if(
@@ -1597,7 +1647,7 @@ private:
 
     for(;;){
     startover:;
-      boost::uint32_t group_counter=arrays.groups[pos0].counter;
+      boost::uint32_t group_counter=counter(pos0);
       if(find_impl(
         k,[&](value_type& x){f(x,false);},pos0,hash))return true;
 
@@ -1607,12 +1657,12 @@ private:
           auto pg=arrays.groups+pos;
           auto mask=pg->match_available();
           if(BOOST_LIKELY(mask!=0)){
-            auto lck=pg->exclusive_access();
+            auto lck=exclusive_access(pos);
             do{
               auto n=unchecked_countr_zero(mask);
               if(pg->at(n)==0){
                 pg->set(n,hash);
-                if(BOOST_UNLIKELY(arrays.groups[pos0].counter++!=group_counter)){
+                if(BOOST_UNLIKELY(counter(pos0)++!=group_counter)){
                   /* some other thread inserted from p0, need to start over */
                   pg->reset(n);
                   goto startover;
