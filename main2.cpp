@@ -83,7 +83,7 @@ using tbb_map_type = tbb::concurrent_hash_map<std::string_view, std::size_t, tbb
 
 inline void increment_element( cfm_map_type& map, std::string_view key )
 {
-    map.emplace_or_visit( key, 0, []( auto& x ){ ++x.second; } );
+    map.emplace_or_visit( key, 1, []( auto& x ){ ++x.second; } );
 }
 
 inline bool contains_element( cfm_map_type const& map, std::string_view key )
