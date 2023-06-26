@@ -110,17 +110,13 @@ template<class Map> BOOST_NOINLINE void test_word_count( Map& map, std::size_t T
 {
     auto t1 = std::chrono::steady_clock::now();
 
-    std::atomic<std::size_t> s = 0;
-
     std::vector<std::thread> th( Th );
 
     std::size_t m = words.size() / Th;
 
     for( std::size_t i = 0; i < Th; ++i )
     {
-        th[ i ] = std::thread( [&map, Th, i, m, &s]{
-
-            std::size_t s2 = 0;
+        th[ i ] = std::thread( [&map, Th, i, m]{
 
             std::size_t start = i * m;
             std::size_t end = i == Th-1? words.size(): (i + 1) * m;
@@ -128,10 +124,7 @@ template<class Map> BOOST_NOINLINE void test_word_count( Map& map, std::size_t T
             for( std::size_t j = start; j < end; ++j )
             {
                 increment_element( map, words[j] );
-                ++s2;
             }
-
-            s += s2;
         });
     }
 
@@ -142,7 +135,7 @@ template<class Map> BOOST_NOINLINE void test_word_count( Map& map, std::size_t T
 
     auto t2 = std::chrono::steady_clock::now();
 
-    std::cout << ";" << ( t2 - t1 ) / 1ms << ";" << s;
+    std::cout << ";" << ( t2 - t1 ) / 1ms << ";" << map.size();
 }
 
 //
@@ -160,7 +153,7 @@ int main()
     init_words();
 
     std::cout << "NUM_THREADS=" << NUM_THREADS << "\n\n";
-    std::cout << "#threads;boost::concurrent_hash_map time;boost::concurrent_hash_map checksum;tbb::concurrent_hash_map time;tbb::concurrent_hash_map checksum" << std::endl;
+    std::cout << "#threads;boost::concurrent_hash_map time;boost::concurrent_hash_map size;tbb::concurrent_hash_map time;tbb::concurrent_hash_map size" << std::endl;
 
     for( std::size_t Th = 1; Th <= NUM_THREADS; ++Th)
     {
